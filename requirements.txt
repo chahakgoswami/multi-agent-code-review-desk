@@ -1,0 +1,6 @@
+# Runtime dependencies (kept minimal for Day 1)
+colorama>=0.4.6
+
+# Development / testing
+pytest>=7.4
+pytest-cov>=4.1
