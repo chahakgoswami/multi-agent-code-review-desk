@@ -47,10 +47,6 @@ class ReviewResult:
     llm_note: str = ""
     parse_error: Optional[str] = None
 
-    # ------------------------------------------------------------------ #
-    # Convenience helpers
-    # ------------------------------------------------------------------ #
-
     def findings_by_severity(self, severity: Severity) -> List[Finding]:
         return [f for f in self.findings if f.severity == severity]
 
@@ -75,33 +71,29 @@ class ReviewResult:
 class _RuleEngine:
     """Applies a catalogue of deterministic heuristic rules to an AST and raw source."""
 
-    # Maximum cyclomatic-complexity proxy: number of branching nodes in a function
     COMPLEXITY_THRESHOLD = 7
-    # Maximum number of lines for a single function before we warn
     LONG_FUNCTION_THRESHOLD = 40
-    # Maximum nesting depth before we warn
     NESTING_DEPTH_THRESHOLD = 4
 
     def run(self, code: str, tree: ast.Module) -> List[Finding]:
         findings: List[Finding] = []
         lines = code.splitlines()
-
         findings.extend(self._check_style(code, lines))
         findings.extend(self._check_ast(tree, lines))
         return findings
 
     # ------------------------------------------------------------------ #
-    # Style checks (regex / text-level)
+    # Style checks (text-level)
     # ------------------------------------------------------------------ #
 
-    def _check_style(self, code: str, lines: List[str]) -> List[Finding]]:
+    def _check_style(self, code: str, lines: List[str]) -> List[Finding]:
         findings: List[Finding] = []
 
         for i, line in enumerate(lines, 1):
-            stripped = line.rstrip()
+            stripped_right = line.rstrip()
 
             # Trailing whitespace
-            if line != stripped and line.endswith((" ", "\t")):
+            if len(line) != len(stripped_right) and (line.endswith(" ") or line.endswith("\t")):
                 findings.append(
                     Finding(
                         rule_id="R001",
@@ -112,19 +104,21 @@ class _RuleEngine:
                     )
                 )
 
-            # Lines that are overly long (>120 chars)
-            if len(stripped) > 120:
+            # Lines exceeding 120 characters
+            if len(stripped_right) > 120:
                 findings.append(
                     Finding(
                         rule_id="R002",
-                        message=f"Line exceeds 120 characters ({len(stripped)} chars).",
+                        message=f"Line exceeds 120 characters ({len(stripped_right)} chars).",
                         severity=Severity.INFO,
                         line=i,
-                        context=stripped[:80] + "...",
+                        context=stripped_right[:80] + "...",
                     )
                 )
 
-            # Use of print() in non-test code
+            stripped = stripped_right.strip()
+
+            # Use of print()
             if re.search(r"\bprint\s*\(", stripped):
                 findings.append(
                     Finding(
@@ -132,7 +126,7 @@ class _RuleEngine:
                         message="print() call found; consider using logging instead.",
                         severity=Severity.INFO,
                         line=i,
-                        context=stripped.strip(),
+                        context=stripped,
                     )
                 )
 
@@ -144,23 +138,23 @@ class _RuleEngine:
                         message="Unresolved TODO/FIXME/HACK comment.",
                         severity=Severity.INFO,
                         line=i,
-                        context=stripped.strip(),
+                        context=stripped,
                     )
                 )
 
             # Bare except
-            if re.match(r"\s*except\s*:", stripped):
+            if re.match(r"except\s*:", stripped):
                 findings.append(
                     Finding(
                         rule_id="R005",
                         message="Bare 'except:' clause silences all exceptions.",
                         severity=Severity.WARNING,
                         line=i,
-                        context=stripped.strip(),
+                        context=stripped,
                     )
                 )
 
-            # Use of eval
+            # Use of eval()
             if re.search(r"\beval\s*\(", stripped):
                 findings.append(
                     Finding(
@@ -168,11 +162,11 @@ class _RuleEngine:
                         message="Use of eval() is a potential code-injection risk.",
                         severity=Severity.ERROR,
                         line=i,
-                        context=stripped.strip(),
+                        context=stripped,
                     )
                 )
 
-            # Use of exec
+            # Use of exec()
             if re.search(r"\bexec\s*\(", stripped):
                 findings.append(
                     Finding(
@@ -180,19 +174,19 @@ class _RuleEngine:
                         message="Use of exec() is dangerous; avoid dynamic code execution.",
                         severity=Severity.ERROR,
                         line=i,
-                        context=stripped.strip(),
+                        context=stripped,
                     )
                 )
 
-            # Mutable default argument (simple regex version; AST version is more accurate)
-            if re.search(r"def\s+\w+\s*\(.*=\s*(\[|\{)", stripped):
+            # Mutable default argument (simple regex approximation)
+            if re.search(r"def\s+\w+\s*\(.*=\s*[\[\{]", stripped):
                 findings.append(
                     Finding(
                         rule_id="R008",
                         message="Possible mutable default argument (list or dict literal).",
                         severity=Severity.WARNING,
                         line=i,
-                        context=stripped.strip(),
+                        context=stripped,
                     )
                 )
 
@@ -219,7 +213,13 @@ class _RuleEngine:
             fn_line = node.lineno
 
             # Missing docstring
-            if not (node.body and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Constant) and isinstance(node.body[0].value.value, str)):
+            has_docstring = (
+                node.body
+                and isinstance(node.body[0], ast.Expr)
+                and isinstance(node.body[0].value, ast.Constant)
+                and isinstance(node.body[0].value.value, str)
+            )
+            if not has_docstring:
                 findings.append(
                     Finding(
                         rule_id="R009",
@@ -240,7 +240,7 @@ class _RuleEngine:
                     )
                 )
 
-            # Missing parameter annotations
+            # Missing parameter annotations (skip self/cls)
             for arg in node.args.args:
                 if arg.annotation is None and arg.arg not in ("self", "cls"):
                     findings.append(
@@ -252,7 +252,7 @@ class _RuleEngine:
                         )
                     )
 
-            # Complexity proxy: count branching nodes
+            # Complexity
             complexity = self._cyclomatic_proxy(node)
             if complexity > self.COMPLEXITY_THRESHOLD:
                 findings.append(
@@ -299,20 +299,22 @@ class _RuleEngine:
                     )
                 )
 
-            # Unreachable code after return/raise
+            # Unreachable code
             findings.extend(self._check_unreachable(node))
 
         return findings
 
     def _check_globals(self, tree: ast.Module, lines: List[str]) -> List[Finding]:
         findings: List[Finding] = []
-        # Detect global variable *mutations* inside functions via 'global' statement
         for node in ast.walk(tree):
             if isinstance(node, ast.Global):
                 findings.append(
                     Finding(
                         rule_id="R015",
-                        message=f"Global variable mutation: 'global {', '.join(node.names)}' inside function.",
+                        message=(
+                            f"Global variable mutation: "
+                            f"'global {', '.join(node.names)}' inside function."
+                        ),
                         severity=Severity.WARNING,
                         line=node.lineno,
                     )
@@ -321,7 +323,6 @@ class _RuleEngine:
 
     def _check_imports(self, tree: ast.Module, lines: List[str]) -> List[Finding]:
         findings: List[Finding] = []
-        # Warn about wildcard imports
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 for alias in node.names:
@@ -329,7 +330,10 @@ class _RuleEngine:
                         findings.append(
                             Finding(
                                 rule_id="R016",
-                                message=f"Wildcard import 'from {node.module} import *' pollutes namespace.",
+                                message=(
+                                    f"Wildcard import 'from {node.module} import *' "
+                                    f"pollutes namespace."
+                                ),
                                 severity=Severity.WARNING,
                                 line=node.lineno,
                             )
@@ -337,7 +341,7 @@ class _RuleEngine:
         return findings
 
     # ------------------------------------------------------------------ #
-    # Helpers
+    # Static helpers
     # ------------------------------------------------------------------ #
 
     @staticmethod
@@ -352,11 +356,11 @@ class _RuleEngine:
             ast.Assert,
             ast.comprehension,
         )
-        count = 1  # base complexity
+        count = 1
         for node in ast.walk(func_node):
             if isinstance(node, branching_types):
                 count += 1
-            elif isinstance(node, ast.BoolOp):  # 'and' / 'or'
+            elif isinstance(node, ast.BoolOp):
                 count += len(node.values) - 1
         return count
 
@@ -378,18 +382,20 @@ class _RuleEngine:
 
     @staticmethod
     def _check_unreachable(func_node: ast.FunctionDef) -> List[Finding]:
-        """Detect statements after return/raise/break/continue at the same level."""
+        """Detect statements after return/raise/break/continue at the same body level."""
         findings: List[Finding] = []
         terminator_types = (ast.Return, ast.Raise, ast.Break, ast.Continue)
 
         def _scan_body(stmts: list) -> None:
             for idx, stmt in enumerate(stmts):
                 if isinstance(stmt, terminator_types):
-                    remaining = stmts[idx + 1 :]
-                    # Filter out lone Expr nodes that are just docstrings / ellipsis
+                    remaining = stmts[idx + 1:]
                     real_remaining = [
                         s for s in remaining
-                        if not (isinstance(s, ast.Expr) and isinstance(s.value, (ast.Constant, ast.Ellipsis)))
+                        if not (
+                            isinstance(s, ast.Expr)
+                            and isinstance(s.value, ast.Constant)
+                        )
                     ]
                     if real_remaining:
                         findings.append(
@@ -400,7 +406,7 @@ class _RuleEngine:
                                 line=real_remaining[0].lineno,
                             )
                         )
-                    break  # no point scanning further siblings
+                    break
                 # Recurse into sub-bodies
                 for attr in ("body", "orelse", "handlers", "finalbody"):
                     sub = getattr(stmt, attr, [])
@@ -459,11 +465,11 @@ class ReviewerAgent(AgentBase):
         llm_response = self._llm.complete(code)
         result.llm_note = llm_response
 
-        # Map LLM response keywords → additional findings
+        # Map LLM response keywords to additional findings
         llm_findings = self._parse_llm_response(llm_response)
         result.findings.extend(llm_findings)
 
-        # --- Confidence heuristic -------------------------------------
+        # --- Confidence -----------------------------------------------
         result.confidence = self._compute_confidence(code, result)
 
         self._last_result = result
@@ -479,7 +485,7 @@ class ReviewerAgent(AgentBase):
         lines.append(f"    errors   : {res.error_count}")
         lines.append(f"    warnings : {res.warning_count}")
         lines.append(f"    info     : {res.info_count}")
-        lines.append(f"  Confidence: {res.confidence:.2f}")
+        lines.append(f"  Confidence: {res.confidence:.4f}")
         if res.parse_error:
             lines.append(f"  Parse error: {res.parse_error}")
         lines.append("  LLM Note  : " + res.llm_note.splitlines()[0])
@@ -490,7 +496,7 @@ class ReviewerAgent(AgentBase):
         return "\n".join(lines)
 
     def confidence_score(self) -> float:
-        """Return confidence of the most recent analysis (0.0–1.0)."""
+        """Return confidence of the most recent analysis (0.0-1.0)."""
         if self._last_result is None:
             return 0.0
         return self._last_result.confidence
@@ -525,8 +531,8 @@ class ReviewerAgent(AgentBase):
     def _compute_confidence(code: str, result: ReviewResult) -> float:
         """Derive a confidence score from code size and finding mix."""
         line_count = len(code.splitlines())
-        # More lines → harder to be certain, but cap at 0.95
+        # Scale confidence with code size up to 0.95
         base = min(0.95, 0.5 + 0.45 * min(line_count, 200) / 200)
-        # Penalise a little for each ERROR finding
+        # Penalise for each ERROR finding
         penalty = 0.02 * result.error_count
         return max(0.1, round(base - penalty, 4))
